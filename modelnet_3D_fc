@@ -1,0 +1,621 @@
+import csv
+import random
+import re
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+
+
+
+
+DATA_ROOT = Path(
+    "/3Dconvolution/ModelNet10_new/modelnet_0721_3layer"
+)
+
+EXPECTED_CLASS_COUNT = 10
+CHANNELS_PER_CLASS = 4
+
+CROP_ROW_START = 911
+CROP_ROW_END = 951
+CROP_COL_START = 1206
+CROP_COL_END = 1246
+
+CROP_HEIGHT = 40
+CROP_WIDTH = 40
+
+PATCH_HEIGHT = 4
+PATCH_WIDTH = 4
+GRID_ROWS = 10
+GRID_COLS = 10
+
+SAMPLES_PER_CLASS = 100
+TRAIN_PER_CLASS = 90
+TEST_PER_CLASS = 10
+
+INPUT_DEPTH = 4
+FLATTEN_DIM = 4 * 4 * 4       # 64
+HIDDEN_DIM = 128
+NUM_CLASSES = 10
+
+BATCH_SIZE = 64
+EPOCHS = 600
+LEARNING_RATE = 5e-4
+WEIGHT_DECAY = 1e-4
+
+NORMALIZE_INPUT = True
+
+SEED = 20
+
+MODEL_SAVE_PATH = "./best_modelnet10_fc_64_128_10_0915.pth"
+PROCESSED_DATA_PATH = "./modelnet10_4x4x4_fc_data.npz"
+SPLIT_CSV_PATH = "./modelnet10_4x4x4_fc_split.csv"
+CONFUSION_MATRIX_PATH = "./confusion_matrix_fc_64_10_10.txt"
+
+SUPPORTED_EXTENSIONS = {
+    ".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"
+}
+
+
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def get_device(preferred_gpu=2):
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+
+    gpu_id = min(preferred_gpu, torch.cuda.device_count() - 1)
+    return torch.device(f"cuda:{gpu_id}")
+
+
+DEVICE = get_device(preferred_gpu=2)
+
+
+
+
+def natural_sort_key(path):
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", path.name)
+    ]
+
+
+def get_class_folders(root):
+    root = Path(root)
+
+    if not root.is_dir():
+        raise FileNotFoundError(f"数据根目录不存在：{root.resolve()}")
+
+    class_folders = sorted(
+        [folder for folder in root.iterdir() if folder.is_dir()],
+        key=natural_sort_key,
+    )
+
+    if len(class_folders) != EXPECTED_CLASS_COUNT:
+        raise RuntimeError(
+            f"期望有{EXPECTED_CLASS_COUNT}个类别文件夹，"
+            f"实际找到{len(class_folders)}个：\n"
+            f"{[folder.name for folder in class_folders]}"
+        )
+
+    return class_folders
+
+
+def get_channel_images(class_folder):
+    image_paths = sorted(
+        [
+            path
+            for path in class_folder.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        ],
+        key=natural_sort_key,
+    )
+
+    if len(image_paths) != CHANNELS_PER_CLASS:
+        raise RuntimeError(
+            f"类别 {class_folder.name} 应包含{CHANNELS_PER_CLASS}张通道图像，"
+            f"实际找到{len(image_paths)}张：\n"
+            f"{[path.name for path in image_paths]}"
+        )
+
+    return image_paths
+
+
+
+
+def load_and_crop_image(image_path):
+    """
+        image[911:951, 1206:1246]
+
+    """
+    with Image.open(image_path) as image:
+        image = image.convert("L")
+        image_array = np.asarray(image, dtype=np.uint8)
+
+    image_height, image_width = image_array.shape
+
+    if (
+        CROP_ROW_START < 0
+        or CROP_COL_START < 0
+        or CROP_ROW_END > image_height
+        or CROP_COL_END > image_width
+    ):
+        raise ValueError(
+            f"裁剪区域超出图片范围：{image_path}\n"
+            f"图片尺寸：{image_height}×{image_width}\n"
+            f"裁剪行：{CROP_ROW_START}:{CROP_ROW_END}\n"
+            f"裁剪列：{CROP_COL_START}:{CROP_COL_END}"
+        )
+
+    cropped = image_array[
+        CROP_ROW_START:CROP_ROW_END,
+        CROP_COL_START:CROP_COL_END,
+    ]
+
+    if cropped.shape != (CROP_HEIGHT, CROP_WIDTH):
+        raise RuntimeError(
+            f"裁剪结果尺寸错误：{cropped.shape}，"
+            f"期望为{CROP_HEIGHT}×{CROP_WIDTH}"
+        )
+
+    return cropped
+
+
+
+
+def split_40_into_100_patches(image_40):
+
+
+    if image_40.shape != (CROP_HEIGHT, CROP_WIDTH):
+        raise ValueError(f"输入应为40×40，实际为{image_40.shape}")
+
+    patches = (
+        image_40
+        .reshape(GRID_ROWS, PATCH_HEIGHT, GRID_COLS, PATCH_WIDTH)
+        .transpose(0, 2, 1, 3)
+        .reshape(SAMPLES_PER_CLASS, PATCH_HEIGHT, PATCH_WIDTH)
+    )
+
+    expected_shape = (SAMPLES_PER_CLASS, PATCH_HEIGHT, PATCH_WIDTH)
+    if patches.shape != expected_shape:
+        raise RuntimeError(
+            f"patch尺寸错误：{patches.shape}，期望为{expected_shape}"
+        )
+
+    return patches
+
+
+
+def build_class_samples(class_folder):
+
+    image_paths = get_channel_images(class_folder)
+    channel_patches = []
+
+    print(f"\n========== {class_folder.name} ==========")
+
+    for channel_index, image_path in enumerate(image_paths, start=1):
+        cropped = load_and_crop_image(image_path)
+        patches = split_40_into_100_patches(cropped)
+        channel_patches.append(patches)
+
+        print(
+            f"channel {channel_index}: {image_path.name} | "
+            f"crop={cropped.shape} | patches={patches.shape}"
+        )
+
+    samples = np.stack(channel_patches, axis=1)
+
+    expected_shape = (
+        SAMPLES_PER_CLASS,
+        INPUT_DEPTH,
+        PATCH_HEIGHT,
+        PATCH_WIDTH,
+    )
+
+    if samples.shape != expected_shape:
+        raise RuntimeError(
+            f"数据立方尺寸错误：{samples.shape}，期望为{expected_shape}"
+        )
+
+    print("Class samples:", samples.shape)
+    return samples
+
+
+def build_dataset_split(root, seed=42, save_npz_path=None, save_csv_path=None):
+    class_folders = get_class_folders(root)
+    class_names = [folder.name for folder in class_folders]
+
+    x_train_parts = []
+    y_train_parts = []
+    x_test_parts = []
+    y_test_parts = []
+    csv_rows = []
+
+    for class_index, class_folder in enumerate(class_folders):
+        samples = build_class_samples(class_folder)
+
+        rng = np.random.default_rng(seed + class_index)
+        sample_order = rng.permutation(SAMPLES_PER_CLASS)
+
+        train_indices = sample_order[:TRAIN_PER_CLASS]
+        test_indices = sample_order[
+            TRAIN_PER_CLASS:TRAIN_PER_CLASS + TEST_PER_CLASS
+        ]
+
+        x_train_parts.append(samples[train_indices])
+        y_train_parts.append(
+            np.full(TRAIN_PER_CLASS, class_index, dtype=np.int64)
+        )
+
+        x_test_parts.append(samples[test_indices])
+        y_test_parts.append(
+            np.full(TEST_PER_CLASS, class_index, dtype=np.int64)
+        )
+
+        for split_name, indices in (
+            ("train", train_indices),
+            ("test", test_indices),
+        ):
+            for sample_index in indices:
+                sample_index = int(sample_index)
+                csv_rows.append({
+                    "split": split_name,
+                    "class_name": class_folder.name,
+                    "class_index": class_index,
+                    "sample_index_0_based": sample_index,
+                    "sample_number_1_based": sample_index + 1,
+                    "grid_row_0_based": sample_index // GRID_COLS,
+                    "grid_col_0_based": sample_index % GRID_COLS,
+                })
+
+        print(
+            f"{class_folder.name}: "
+            f"train={len(train_indices)}, test={len(test_indices)}"
+        )
+
+    x_train = np.concatenate(x_train_parts, axis=0)
+    y_train = np.concatenate(y_train_parts, axis=0)
+    x_test = np.concatenate(x_test_parts, axis=0)
+    y_test = np.concatenate(y_test_parts, axis=0)
+
+    global_rng = np.random.default_rng(seed)
+    train_order = global_rng.permutation(len(x_train))
+    test_order = global_rng.permutation(len(x_test))
+
+    x_train = x_train[train_order]
+    y_train = y_train[train_order]
+    x_test = x_test[test_order]
+    y_test = y_test[test_order]
+
+    print("\n========== Dataset ==========")
+    print("x_train:", x_train.shape, x_train.dtype)
+    print("y_train:", y_train.shape)
+    print("x_test:", x_test.shape, x_test.dtype)
+    print("y_test:", y_test.shape)
+
+    if save_npz_path is not None:
+        np.savez_compressed(
+            save_npz_path,
+            x_train=x_train,
+            y_train=y_train,
+            x_test=x_test,
+            y_test=y_test,
+            class_names=np.asarray(class_names),
+        )
+        print("Processed data saved to:", save_npz_path)
+
+    if save_csv_path is not None:
+        with open(save_csv_path, "w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=[
+                    "split",
+                    "class_name",
+                    "class_index",
+                    "sample_index_0_based",
+                    "sample_number_1_based",
+                    "grid_row_0_based",
+                    "grid_col_0_based",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(csv_rows)
+
+        print("Split CSV saved to:", save_csv_path)
+
+    return class_names, x_train, y_train, x_test, y_test
+
+
+
+class CubeDataset(Dataset):
+    def __init__(self, cubes, labels, normalize=True):
+        self.cubes = cubes
+        self.labels = labels
+        self.normalize = normalize
+
+    def __len__(self):
+        return len(self.cubes)
+
+    def __getitem__(self, index):
+        cube = self.cubes[index].astype(np.float32, copy=False)
+
+        if self.normalize:
+            cube = cube / 255.0
+
+        x = torch.from_numpy(cube)
+        y = torch.tensor(self.labels[index], dtype=torch.long)
+        return x, y
+
+
+
+class FCClassifier(nn.Module):
+
+    def __init__(
+        self,
+        num_classes=10,
+        hidden_dim=128
+    ):
+        super().__init__()
+
+        flatten_dim = 4 * 4 * 4
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.LayerNorm(flatten_dim),
+            nn.Linear(
+                flatten_dim,
+                hidden_dim
+            ),
+            nn.ReLU(inplace=True),
+            nn.Linear(
+                hidden_dim,
+                num_classes
+            ),
+        )
+
+        self._initialize_classifier()
+
+    def _initialize_classifier(self):
+        for module in self.classifier.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(
+                    module.weight,
+                    mean=0.0,
+                    std=0.01
+                )
+                nn.init.zeros_(
+                    module.bias
+                )
+
+    def forward(self, x):
+        return self.classifier(x)
+
+
+def train_one_epoch(model, loader, criterion, optimizer):
+    model.train()
+
+    total_loss = 0.0
+    predictions_all = []
+    labels_all = []
+
+    for x, y in loader:
+        x = x.to(DEVICE)
+        y = y.to(DEVICE)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * x.size(0)
+
+        predictions = torch.argmax(logits, dim=1)
+        predictions_all.append(predictions.detach().cpu().numpy())
+        labels_all.append(y.detach().cpu().numpy())
+
+    predictions_all = np.concatenate(predictions_all)
+    labels_all = np.concatenate(labels_all)
+
+    average_loss = total_loss / len(loader.dataset)
+    accuracy = accuracy_score(labels_all, predictions_all)
+
+    return average_loss, accuracy
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion=None):
+    model.eval()
+
+    total_loss = 0.0
+    predictions_all = []
+    labels_all = []
+
+    for x, y in loader:
+        x = x.to(DEVICE)
+        y = y.to(DEVICE)
+
+        logits = model(x)
+
+        if criterion is not None:
+            total_loss += criterion(logits, y).item() * x.size(0)
+
+        predictions = torch.argmax(logits, dim=1)
+        predictions_all.append(predictions.cpu().numpy())
+        labels_all.append(y.cpu().numpy())
+
+    predictions_all = np.concatenate(predictions_all)
+    labels_all = np.concatenate(labels_all)
+
+    average_loss = (
+        0.0 if criterion is None else total_loss / len(loader.dataset)
+    )
+    accuracy = accuracy_score(labels_all, predictions_all)
+
+    return average_loss, accuracy, labels_all, predictions_all
+
+
+def main():
+    set_seed(SEED)
+
+    print("Using device:", DEVICE)
+    print("Data root:", DATA_ROOT.resolve())
+    print(
+        "Crop:",
+        f"rows [{CROP_ROW_START}:{CROP_ROW_END}], "
+        f"cols [{CROP_COL_START}:{CROP_COL_END}]",
+    )
+    print("Sample shape: 4×4×4")
+    print("Classifier: LayerNorm(64) → 64 → 128 → ReLU → 10")
+
+    class_names, x_train, y_train, x_test, y_test = build_dataset_split(
+        root=DATA_ROOT,
+        seed=SEED,
+        save_npz_path=PROCESSED_DATA_PATH,
+        save_csv_path=SPLIT_CSV_PATH,
+    )
+
+    train_dataset = CubeDataset(
+        x_train,
+        y_train,
+        normalize=NORMALIZE_INPUT,
+    )
+
+    test_dataset = CubeDataset(
+        x_test,
+        y_test,
+        normalize=NORMALIZE_INPUT,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        drop_last=False,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+    )
+
+    model = FCClassifier(
+        num_classes=len(class_names),
+        hidden_dim=HIDDEN_DIM
+    ).to(DEVICE)
+
+    print("\nModel:")
+    print(model)
+
+    total_parameters = sum(
+        parameter.numel() for parameter in model.parameters()
+    )
+    print("Trainable parameters:", total_parameters)
+
+    criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=EPOCHS,
+    )
+
+ 
+    best_train_loss = float("inf")
+
+    for epoch in range(1, EPOCHS + 1):
+        train_loss, train_accuracy = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+        )
+
+        scheduler.step()
+
+        if train_loss < best_train_loss:
+            best_train_loss = train_loss
+            torch.save(model.state_dict(), MODEL_SAVE_PATH)
+
+        print(
+            f"Epoch [{epoch:03d}/{EPOCHS:03d}] | "
+            f"Train Loss: {train_loss:.6f} | "
+            f"Train Acc: {train_accuracy:.4f} | "
+            f"Best Loss: {best_train_loss:.6f}"
+        )
+
+    print("\nLoading best model...")
+
+    model.load_state_dict(
+        torch.load(MODEL_SAVE_PATH, map_location=DEVICE)
+    )
+
+    _, test_accuracy, y_true, y_pred = evaluate(
+        model,
+        test_loader,
+        criterion=None,
+    )
+
+    matrix = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=list(range(len(class_names))),
+    )
+
+    print("\n========== Final result ==========")
+    print(f"Test Accuracy: {test_accuracy:.4f}")
+
+    print("\nConfusion Matrix:")
+    print(matrix)
+
+    print("\nClassification Report:")
+    print(
+        classification_report(
+            y_true,
+            y_pred,
+            target_names=class_names,
+            digits=4,
+            zero_division=0,
+        )
+    )
+
+    np.savetxt(
+        CONFUSION_MATRIX_PATH,
+        matrix,
+        fmt="%d",
+    )
+
+    print("\nFinished.")
+    print("Model:", MODEL_SAVE_PATH)
+    print("Processed data:", PROCESSED_DATA_PATH)
+    print("Split CSV:", SPLIT_CSV_PATH)
+    print("Confusion matrix:", CONFUSION_MATRIX_PATH)
+
+
+if __name__ == "__main__":
+    main()
